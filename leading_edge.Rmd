@@ -1,0 +1,226 @@
+---
+title: "Figure 5：共同通路核心贡献基因分析"
+author: "MASS–CMAISE transcriptome analysis"
+date: "2026-09-24"
+output: html_document
+---
+
+## 1. 输入和固定规则
+
+本文件可逐段运行。leading-edge 是GSEA的核心贡献成员，不表示因果驱动或独立验证。所有效应均为HTG相对非HTG。只使用原始完整检验集合中的FDR。
+
+```{r setup}
+options(stringsAsFactors=FALSE)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+root <- normalizePath("../../../", mustWork=TRUE)
+out <- file.path(root,"code/Outputs/260924_Figure5_leading_edge")
+inp <- file.path(out,"inputs"); tab <- file.path(out,"tables"); fig <- file.path(out,"figures")
+dir.create(inp,recursive=TRUE,showWarnings=FALSE); dir.create(tab,showWarnings=FALSE); dir.create(fig,showWarnings=FALSE)
+src <- list(
+ mass_gsea=file.path(root,"code/Outputs/260920_reproducibility_audit/FULL_MASS_batches_1_2_age_ge65_HTG_vs_nonHTG_GSEA_GOBP.csv"),
+ cmaise_gsea=file.path(root,"code/Outputs/260920_reproducibility_audit/FULL_SRR_age_ge65_HTG_vs_nonHTG_GSEA_GOBP.csv"),
+ mass_deg=file.path(root,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/MASS_batches_1_2_age_ge65_HTG_vs_nonHTG_all_genes.csv"),
+ cmaise_deg=file.path(root,"code/Outputs/260803_DEGstratifiedbyAge/SRR/SRR_age_ge65_HTG_vs_nonHTG_all_genes.csv"),
+ gmt="/Users/huangsisi/workspace/MASS/AI_MASS/Utility/c5.go.bp.v2025.1.Hs.symbols.gmt",
+ annotation="/Users/huangsisi/workspace/MASS/AI_MASS/Utility/gene_attr_1019.csv",
+ model=file.path(root,"code/260803_DEGstratifiedbyAge.R"),
+ mass_metadata=file.path(root,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/analysis_metadata_CAP_SAP.csv"),
+ cmaise_metadata=file.path(root,"code/Outputs/260803_DEGstratifiedbyAge/SRR/analysis_metadata_full_cohort.csv"),
+ audit=file.path(root,"code/Outputs/260920_reproducibility_audit/ranking_universe_counts.csv"),
+ validation=file.path(root,"code/Outputs/260813_2_DEGstratifiedbyAge_venn/GOBP_validation_summary.csv"))
+stopifnot(all(file.exists(unlist(src))))
+manifest <- data.frame(name=names(src),path=unlist(src),sha256=vapply(src,function(p) strsplit(system2("shasum",c("-a","256",shQuote(p)),stdout=TRUE)," ")[[1]][1],""),stringsAsFactors=FALSE)
+
+fwrite(manifest,file.path(tab,"input_manifest.csv"))
+file.copy(unlist(src[c("mass_gsea","cmaise_gsea","mass_deg","cmaise_deg","mass_metadata","cmaise_metadata","audit","validation")]),inp,overwrite=TRUE)
+```
+
+## 2. 来源、样本和排序向量核对
+
+按原脚本的symbol去重规则重建完整排序向量：有限Wald统计量、按绝对值降序、每个symbol保留首条。原GSEA结果本身保存了leading-edge；因此不重新运行或重算通路FDR。
+
+```{r audit-inputs}
+mg <- fread(src$mass_gsea); cg <- fread(src$cmaise_gsea)
+md <- fread(src$mass_deg); cd <- fread(src$cmaise_deg)
+mm <- fread(src$mass_metadata)[Age_group==">=65"]
+cm <- fread(src$cmaise_metadata)[Age_group==">=65"]
+stopifnot(nrow(mm)==249,nrow(cm)==127,sum(mm$HTG_group=="HTG")==68,sum(cm$HTG_group=="HTG")==21)
+stopifnot(!anyDuplicated(mm$SampleID),!anyDuplicated(cm$SampleID))
+fwrite(mm,file.path(tab,"MASS_age_ge65_sample_list.csv"))
+fwrite(cm,file.path(tab,"CMAISE_age_ge65_sample_list.csv"))
+stopifnot(!anyDuplicated(mg$pathway),!anyDuplicated(cg$pathway))
+stopifnot(all(c("gene_id","SYMBOL","log2FoldChange","stat","pvalue","padj") %in% names(md)))
+make_rank <- function(d) {
+ d <- d[!is.na(SYMBOL) & SYMBOL!="" & !grepl("^ENSG",SYMBOL) & is.finite(stat)]
+ d <- d[order(-abs(stat),seq_len(nrow(d)))]; d <- d[!duplicated(SYMBOL)]
+ d <- d[order(-stat,SYMBOL)]
+ setNames(d$stat,d$SYMBOL)
+}
+mr <- make_rank(md); cr <- make_rank(cd)
+fwrite(data.table(symbol=names(mr),stat=unname(mr)),file.path(tab,"MASS_full_GSEA_rank.csv"))
+fwrite(data.table(symbol=names(cr),stat=unname(cr)),file.path(tab,"CMAISE_full_GSEA_rank.csv"))
+stopifnot(length(mr)==16768,length(cr)==18929)
+stopifnot(sum(md$padj<.05,na.rm=TRUE)==357,sum(mg$padj<.05,na.rm=TRUE)==210)
+v <- fread(src$validation); stopifnot(v$MASS_FDR_lt_0.05==210,v$same_direction==196,v$same_direction_and_SRR_FDR_lt_0.05==163)
+gmt_lines <- readLines(src$gmt,warn=FALSE)
+parts <- strsplit(gmt_lines,"\t",fixed=TRUE)
+sets <- setNames(lapply(parts,function(x) unique(x[-c(1,2)])),vapply(parts,`[`,"",1))
+stopifnot(all(mg$pathway %in% names(sets)),all(cg$pathway %in% names(sets)))
+check_le <- function(g,r) data.table(pathway=g$pathway,leading_in_rank=vapply(g$leadingEdge,function(z) all(strsplit(z,";",fixed=TRUE)[[1]] %in% names(r)),logical(1)),leading_in_set=mapply(function(z,p) all(strsplit(z,";",fixed=TRUE)[[1]] %in% sets[[p]]),g$leadingEdge,g$pathway))
+le_check <- rbindlist(list(cbind(cohort="MASS",check_le(mg,mr)),cbind(cohort="CMAISE",check_le(cg,cr))))
+fwrite(le_check,file.path(tab,"leading_edge_source_integrity.csv"))
+stopifnot(all(le_check$leading_in_rank),all(le_check$leading_in_set))
+cross <- merge(mg[,.(pathway,mass_NES=NES,mass_FDR=padj)],cg[,.(pathway,cmaise_NES=NES,cmaise_FDR=padj)],by="pathway")
+cross <- cross[mass_FDR<.05]
+stopifnot(nrow(cross)==210,sum(sign(cross$mass_NES)==sign(cross$cmaise_NES))==196,sum(sign(cross$mass_NES)==sign(cross$cmaise_NES)&cross$cmaise_FDR<.05)==163)
+set_audit <- merge(mg[,.(pathway,mass_size=size)],cg[,.(pathway,cmaise_size=size)],by="pathway")
+set_audit[,database_members:=lengths(sets[pathway])]
+set_audit[,same_source_database:=TRUE]
+fwrite(set_audit,file.path(tab,"gene_set_definition_audit.csv"))
+source_audit <- data.table(check=c("MASS age>=65","CMAISE age>=65","MASS HTG","CMAISE HTG","MASS DEG FDR<0.05","MASS GO FDR<0.05","same NES direction","same NES and CMAISE FDR<0.05","early run MASS DEG","early run MASS GO"),value=c(249,127,68,21,357,210,196,163,305,208),status=c(rep("verified",8),rep("earlier version; do not substitute",2)))
+fwrite(source_audit,file.path(tab,"source_version_audit.csv"))
+```
+
+## 3. 通路选择与分类
+
+六条主图通路预先固定，双队列均需FDR<0.05且NES同向。氧化磷酸化仅作队列差异对照。线粒体翻译和线粒体基因表达分别列账。
+
+```{r pathways}
+selection <- data.table(
+ pathway=paste0("GOBP_",c("DNA_REPLICATION","CELL_CYCLE_PHASE_TRANSITION","MACROAUTOPHAGY","ENDOSOME_ORGANIZATION","LYTIC_VACUOLE_ORGANIZATION","REGULATION_OF_VESICLE_MEDIATED_TRANSPORT","OXIDATIVE_PHOSPHORYLATION","MITOCHONDRIAL_TRANSLATION","MITOCHONDRIAL_GENE_EXPRESSION")),
+ theme=c("Cell cycle / DNA replication","Cell cycle / DNA replication","Autophagy","Endosome / lysosome / vesicles","Endosome / lysosome / vesicles","Endosome / lysosome / vesicles","Oxidative phosphorylation","Mitochondrial translation","Mitochondrial gene expression"),
+ intended=c(rep("main",6),"cohort-difference control","separate context","separate context"),
+ reason=c("Specific replication machinery","Cell-cycle transition coverage","Direct autophagy process","Specific endosomal organization","Lysosomal compartment coverage","Transport machinery complement","MASS-only enrichment test case","Distinct from oxidative phosphorylation","Distinct from oxidative phosphorylation"))
+selection <- merge(selection,mg[,.(pathway,mass_ES=ES,mass_NES=NES,mass_p=pval,mass_FDR=padj,mass_size=size)],by="pathway",all.x=TRUE,sort=FALSE)
+selection <- merge(selection,cg[,.(pathway,cmaise_ES=ES,cmaise_NES=NES,cmaise_p=pval,cmaise_FDR=padj,cmaise_size=size)],by="pathway",all.x=TRUE,sort=FALSE)
+selection[,comparable:=pathway %in% names(sets) & !is.na(mass_size) & !is.na(cmaise_size)]
+selection[,common_enrichment:=comparable & mass_FDR<.05 & cmaise_FDR<.05 & sign(mass_NES)==sign(cmaise_NES)]
+stopifnot(all(selection[intended=="main",common_enrichment]),!selection[pathway=="GOBP_OXIDATIVE_PHOSPHORYLATION",common_enrichment])
+selection[,classification:=fifelse(common_enrichment,"common enriched",fifelse(intended=="cohort-difference control","cohort difference","context only"))]
+fwrite(selection,file.path(tab,"pathway_selection.csv"))
+main_paths <- selection[intended=="main",pathway]
+```
+
+## 4. ID匹配、共同可分析范围与集合运算
+
+原GSEA使用symbol。只为两个队列均能唯一对应同一个稳定Ensembl ID的symbol计算跨队列交集；歧义映射单列。通路的U为其数据库成员中在两个完整排序向量里均出现、且ID映射可靠的基因。
+
+```{r overlap}
+ann <- fread(src$annotation); ann[,gene_id_clean:=sub("\\..*$","",gene_id)]
+valid_symbols <- intersect(names(mr),names(cr))
+symbol_ids <- rbindlist(list(md[,.(SYMBOL,gene_id_clean)],cd[,.(SYMBOL,gene_id_clean)]),fill=TRUE)
+symbol_ids <- unique(symbol_ids[!is.na(SYMBOL)&SYMBOL!=""&!is.na(gene_id_clean)&gene_id_clean!=""])
+id_count <- symbol_ids[,.(id_count=uniqueN(gene_id_clean),stable_id=if(uniqueN(gene_id_clean)==1) unique(gene_id_clean) else NA_character_),by=SYMBOL]
+id_ok <- id_count[id_count==1,SYMBOL]
+map <- setNames(id_count$stable_id,id_count$SYMBOL)
+lookup <- function(d) {
+ idx <- order(-abs(d$stat),seq_len(nrow(d)))
+ idx <- idx[!duplicated(d$SYMBOL[idx])]
+ setNames(idx,d$SYMBOL[idx])
+}
+mi <- lookup(md); ci <- lookup(cd)
+le <- function(g,p) {z<-g[pathway==p,leadingEdge]; if(!length(z)||is.na(z)) character() else unique(strsplit(z,";",fixed=TRUE)[[1]])}
+path_gene <- list(); overlap <- list(); unmatch <- list()
+for(p in selection$pathway) {
+ A<-le(mg,p); B<-le(cg,p); U<-intersect(intersect(sets[[p]],valid_symbols),id_ok)
+ aa<-intersect(A,U); bb<-intersect(B,U); shared<-intersect(aa,bb); uni<-union(aa,bb)
+ agree<-sum(sign(md$log2FoldChange[mi[shared]])==sign(cd$log2FoldChange[ci[shared]]),na.rm=TRUE)
+ disagree<-sum(sign(md$log2FoldChange[mi[shared]])!=sign(cd$log2FoldChange[ci[shared]]),na.rm=TRUE)
+ overlap[[p]]<-data.table(pathway=p,theme=selection[pathway==p,theme],mass_le_raw=length(A),cmaise_le_raw=length(B),common_analyzable=length(U),mass_le_comparable=length(aa),cmaise_le_comparable=length(bb),shared=length(shared),mass_only=length(setdiff(aa,bb)),cmaise_only=length(setdiff(bb,aa)),jaccard=if(length(uni))length(shared)/length(uni) else NA_real_,shared_same_direction=agree,shared_opposite_direction=disagree,shared_direction_evaluable=agree+disagree,shared_same_fraction=if(agree+disagree)agree/(agree+disagree) else NA_real_)
+ path_gene[[p]]<-data.table(pathway=p,symbol=uni,stable_id=unname(map[uni]),membership=fifelse(uni %in% shared,"shared",fifelse(uni %in% aa,"MASS only","CMAISE only")))
+ bad<-setdiff(union(A,B),U)
+ if(length(bad)) unmatch[[p]]<-data.table(pathway=p,symbol=bad,mass_le=bad %in% A,cmaise_le=bad %in% B,reason=fifelse(!bad %in% names(mr),fifelse(bad %in% md$SYMBOL,"MASS full DEG row excluded from rank","absent from MASS full DEG table; detection/filtering cannot be distinguished"),fifelse(!bad %in% names(cr),fifelse(bad %in% cd$SYMBOL,"CMAISE full DEG row excluded from rank","absent from CMAISE full DEG table; detection/filtering cannot be distinguished"),fifelse(!bad %in% id_ok,"ambiguous or missing stable ID","not in source gene set"))))
+}
+overlap<-rbindlist(overlap); members<-rbindlist(path_gene); unmatched<-rbindlist(unmatch,fill=TRUE)
+fwrite(overlap,file.path(tab,"pathway_leading_edge_overlap.csv")); fwrite(members,file.path(tab,"pathway_gene_membership.csv")); fwrite(unmatched,file.path(tab,"unmatched_or_filtered_genes.csv"))
+```
+
+## 5. GO冗余与完整候选基因
+
+条目之间的重叠作为描述性冗余；不对通路内部成员做全基因组背景重叠检验。
+
+```{r candidates}
+pair <- combn(main_paths,2,simplify=FALSE)
+redundancy <- rbindlist(lapply(pair,function(z) {
+ a<-members[pathway==z[1],symbol]; b<-members[pathway==z[2],symbol]
+ data.table(pathway_1=z[1],pathway_2=z[2],shared=length(intersect(a,b)),union=length(union(a,b)),jaccard=if(length(union(a,b)))length(intersect(a,b))/length(union(a,b)) else NA_real_,shared_symbols=paste(sort(intersect(a,b)),collapse=";"))
+}))
+fwrite(redundancy,file.path(tab,"GO_redundancy.csv"))
+main_members<-members[pathway %in% main_paths]
+genes<-unique(main_members$symbol)
+theme_levels<-c("Cell cycle / DNA replication","Autophagy","Endosome / lysosome / vesicles")
+candidate<-rbindlist(lapply(genes,function(s) {
+ ps<-main_members[symbol==s,pathway]; m<-s %in% unlist(lapply(ps,function(p)le(mg,p))); c<-s %in% unlist(lapply(ps,function(p)le(cg,p)))
+ x<-md[mi[[s]]]; y<-cd[ci[[s]]]
+ data.table(symbol=s,stable_id=unname(map[s]),pathways=paste(ps,collapse=";"),themes=paste(unique(selection[pathway %in% ps,theme]),collapse=";"),primary_theme=theme_levels[match(TRUE,theme_levels %in% selection[pathway %in% ps,theme])],membership=fifelse(m&c,"shared",fifelse(m,"MASS only","CMAISE only")),mass_le=m,cmaise_le=c,mass_log2FC=x$log2FoldChange,cmaise_log2FC=y$log2FoldChange,mass_stat=x$stat,cmaise_stat=y$stat,mass_p=x$pvalue,cmaise_p=y$p,mass_FDR=x$padj,cmaise_FDR=y$padj,mass_baseMean=x$baseMean,cmaise_baseMean=y$baseMean,mass_lfcSE=x$lfcSE,cmaise_lfcSE=y$lfcSE)
+}))
+percentile <- function(r) setNames(rank(abs(r),ties.method="average")/length(r),names(r))
+mp<-percentile(mr); cp<-percentile(cr)
+candidate[,mean_abs_rank_percentile:=(unname(mp[symbol])+unname(cp[symbol]))/2]
+candidate[,same_log2FC_direction:=sign(mass_log2FC)==sign(cmaise_log2FC)]
+stopifnot(!anyNA(candidate$stable_id),!anyDuplicated(candidate$symbol))
+mass_by_id <- setNames(md$log2FoldChange,md$gene_id_clean)
+cmaise_by_id <- setNames(cd$log2FoldChange,cd$gene_id_clean)
+stopifnot(isTRUE(all.equal(candidate$mass_log2FC,unname(mass_by_id[candidate$stable_id]),tolerance=1e-12)))
+stopifnot(isTRUE(all.equal(candidate$cmaise_log2FC,unname(cmaise_by_id[candidate$stable_id]),tolerance=1e-12)))
+fwrite(candidate,file.path(tab,"all_candidate_genes.csv"))
+```
+
+## 6. 主图展示筛选
+
+固定上限42行，主题名额14/14/14；不足名额按固定主题顺序转给其他主题。每个主题先兼顾三类成员，再用平均绝对排序百分位补足。多主题基因只显示一次。完整候选保留在附表。
+
+```{r display-selection}
+candidate[,theme_order:=match(primary_theme,theme_levels)]
+setorder(candidate,theme_order,-mean_abs_rank_percentile,stable_id)
+chosen<-character(); quota<-14L
+for(t in theme_levels) {
+ d<-candidate[primary_theme==t]
+ picks<-character()
+ for(cat in c("shared","MASS only","CMAISE only")) {
+  z<-d[membership==cat & !symbol %in% picks,symbol]
+  picks<-c(picks,head(z,min(3,length(z))))
+ }
+ picks<-c(picks,head(d[!symbol %in% picks,symbol],max(0,quota-length(picks))))
+ chosen<-c(chosen,head(picks,quota))
+}
+if(length(chosen)<min(42,nrow(candidate))) chosen<-c(chosen,head(candidate[!symbol %in% chosen,symbol],42-length(chosen)))
+candidate[,display:=symbol %in% chosen]
+candidate[,display_reason:=fifelse(display,"theme quota and category coverage; ranked by mean absolute-stat percentile","not shown after fixed 42-row limit")]
+candidate[,display_order:=match(symbol,chosen)]
+fwrite(candidate[,.(symbol,stable_id,primary_theme,membership,mean_abs_rank_percentile,display,display_order,display_reason)],file.path(tab,"display_selection.csv"))
+display<-candidate[display==TRUE][order(display_order)]
+fwrite(display,file.path(tab,"Figure5_panel_source_data.csv"))
+```
+
+## 7. 热图导出
+
+统一log2FC色标，0为中心；颜色超过±2时截断，Source Data保留原始数值。点表示leading-edge成员，星号表示对应队列基因层面原始FDR<0.05。
+
+```{r figure}
+plot_data<-rbindlist(list(display[,.(symbol,primary_theme,display_order,cohort="MASS",log2FC=mass_log2FC,leading=mass_le,FDR=mass_FDR)],display[,.(symbol,primary_theme,display_order,cohort="CMAISE",log2FC=cmaise_log2FC,leading=cmaise_le,FDR=cmaise_FDR)]))
+plot_data[,cohort:=factor(cohort,levels=c("MASS","CMAISE"))]
+plot_data[,symbol:=factor(symbol,levels=rev(display$symbol))]
+plot_data[,theme:=factor(primary_theme,levels=theme_levels)]
+plot_data[,fdr_mark:=ifelse(!is.na(FDR)&FDR<.05,"*","")]
+p<-ggplot(plot_data,aes(cohort,symbol,fill=pmax(-2,pmin(2,log2FC))))+
+ geom_tile(color="white",linewidth=.5,width=.92,height=.91)+
+ geom_text(aes(label=paste0(ifelse(leading,"L",""),fdr_mark)),size=3.0,color="#191919")+
+ facet_grid(theme~.,scales="free_y",space="free_y",switch="y")+
+ scale_fill_gradient2(low="#276597",mid="white",high="#B44739",midpoint=0,limits=c(-2,2),breaks=c(-2,-1,0,1,2),name="log2FC\n(clipped +/-2)")+
+ labs(x=NULL,y=NULL,caption="L leading-edge member    * gene-level FDR < 0.05; HTG versus non-HTG")+
+ theme_minimal(base_size=9)+theme(panel.grid=element_blank(),strip.placement="outside",strip.background=element_rect(fill="#F2F2F2",color=NA),strip.text.y.left=element_text(angle=90,size=8),axis.text.y=element_text(size=7.2,face="italic"),axis.text.x=element_text(size=9,face="bold"),plot.caption=element_text(size=7,hjust=0),panel.spacing.y=grid::unit(1,"mm"),legend.position="right")
+height<-max(6.8,1.1+0.18*nrow(display))
+ggsave(file.path(fig,"Figure5_leading_edge_heatmap.pdf"),p,width=5.8,height=height,device=cairo_pdf)
+ggsave(file.path(fig,"Figure5_leading_edge_heatmap.svg"),p,width=5.8,height=height,device=svglite::svglite)
+ggsave(file.path(fig,"Figure5_leading_edge_heatmap.png"),p,width=5.8,height=height,dpi=400,device=ragg::agg_png)
+ggsave(file.path(fig,"Figure5_leading_edge_heatmap.tiff"),p,width=5.8,height=height,dpi=600,device=ragg::agg_tiff,compression="lzw")
+```
+
+## 8. 版本与会话
+
+```{r session}
+writeLines(capture.output(sessionInfo()),file.path(tab,"session_info.txt"))
+```

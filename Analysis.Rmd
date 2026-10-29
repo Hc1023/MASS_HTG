@@ -1,0 +1,296 @@
+---
+title: "MASS Figure 4: continuous TG, whole-blood programs and immune phenotypes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE)
+library(data.table); library(dplyr); library(tidyr); library(ggplot2)
+library(edgeR); library(limma); library(GSVA); library(patchwork)
+root <- normalizePath(".")
+out <- file.path(root,"results"); fig <- file.path(root,"figures")
+dir.create(out,recursive=TRUE,showWarnings=FALSE); dir.create(fig,recursive=TRUE,showWarnings=FALSE)
+project <- normalizePath("..")
+source_path <- "/Users/huangsisi/workspace/MASS/AI_MASS"
+save_csv <- function(x,n) fwrite(as.data.frame(x),file.path(out,n))
+```
+
+## Locked analysis definitions
+
+These 14 external GO BP sets are exploratory because their themes were selected after seeing the earlier differential-expression results. The exposure family comprises all eligible sets in the list below, across both transcript and lipid themes. The immune family comprises every eligible set crossed with the five fixed phenotypes. BH adjustment is performed separately for these two primary families; models and cohorts labelled sensitivity are not mixed into either family.
+
+```{r lock}
+spec <- data.frame(term=c(
+ "GOBP_CELL_CYCLE_G1_S_PHASE_TRANSITION","GOBP_DNA_TEMPLATED_DNA_REPLICATION",
+ "GOBP_OXIDATIVE_PHOSPHORYLATION","GOBP_AEROBIC_RESPIRATION",
+ "GOBP_MACROAUTOPHAGY","GOBP_ENDOSOME_ORGANIZATION",
+ "GOBP_ENDOSOME_TO_LYSOSOME_TRANSPORT","GOBP_POST_GOLGI_VESICLE_MEDIATED_TRANSPORT",
+ "GOBP_INTRACELLULAR_LIPID_TRANSPORT","GOBP_TRIGLYCERIDE_BIOSYNTHETIC_PROCESS",
+ "GOBP_LIPID_DROPLET_FORMATION","GOBP_LIPID_DROPLET_ORGANIZATION",
+ "GOBP_NEUTRAL_LIPID_CATABOLIC_PROCESS","GOBP_FATTY_ACID_BETA_OXIDATION"),
+ theme=c(rep("Core transcript program",8),rep("Lipid handling",6)))
+stopifnot(!anyDuplicated(spec$term))
+save_csv(spec,"locked_gene_sets.csv")
+save_csv(data.frame(family=c("TG primary","Immune primary"),
+ scope=c("All 14 eligible sets in age >=65 minimal model",
+ "All eligible sets x IL-8, ferritin, platelets, hsCRP, PCT in age >=65 minimal model"),
+ correction="BH within family; no outcome-dependent exclusion"),"fdr_families.csv")
+```
+
+## Input audit and one-patient-one-sample connection
+
+The RNA selection is D1 and CAP/SAP, matching the existing 390-person analysis. Metadata values are source values, not inferred from plots. Exact clinical assay collection timestamps, units and detection limits are not present in the joined patient-level CSV and are tracked as unresolved provenance.
+
+```{r input}
+load(file.path(source_path,"Transcriptome/260724/blood_counts_combined.rdata"))
+raw_counts <- counts; rna_meta <- meta; rm(counts,meta)
+clinical <- fread(file.path(project,"code/Outputs/260727_meta.csv"))
+gene_attr <- fread(file.path(source_path,"Utility/gene_attr_1019.csv"))
+legacy <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/analysis_metadata_CAP_SAP.csv"))
+legacy_deg <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/DEG_summary.csv"))
+legacy_gene <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/MASS_batches_1_2_age_ge65_HTG_vs_nonHTG_all_genes.csv"))
+stopifnot(!anyDuplicated(clinical$HumanID), !anyDuplicated(legacy$HumanID),
+ !anyDuplicated(legacy$SampleID), !anyDuplicated(rownames(raw_counts)),
+ all(legacy$SampleID %in% colnames(raw_counts)))
+rna_meta$HumanID <- sub("_(D1|D4|D7|D14|D21)$","",rna_meta$SampleID)
+rna_meta$Timepoint <- sub("^.*_(D1|D4|D7|D14|D21)$","\\1",rna_meta$SampleID)
+stopifnot(all(legacy$SampleID %in% rna_meta$SampleID), all(legacy$Timepoint=="D1"),
+ all(legacy$Triglycerides>0), all(legacy$HTG_group==ifelse(legacy$Triglycerides>=1.7,"HTG","non_HTG")))
+dat <- as.data.frame(legacy) %>% select(-any_of(c("SOFA_scaled","Propofol"))) %>%
+ left_join(as.data.frame(clinical) %>% select(HumanID,`IL-8`,Ferritin,Platelets,hsCRP,PCT,Propofol),by="HumanID")
+stopifnot(nrow(dat)==390, !anyDuplicated(dat$HumanID),
+ identical(dat$SampleID, colnames(raw_counts[,dat$SampleID,drop=FALSE])))
+dat$age_stratum <- ifelse(dat$Age>=65,"ge65","lt65")
+dat$log2TG <- log2(dat$Triglycerides)
+dat$batch <- factor(dat$batch); dat$Gender <- factor(dat$Gender)
+dat$MV <- factor(dat$MV); dat$Tumor <- factor(dat$Tumor)
+dat$TransplantHistory <- factor(dat$TransplantHistory)
+dat$Immunosuppression <- factor(dat$Immunosuppression)
+save_csv(dat,"analysis_metadata.csv")
+save_csv(as.data.frame(with(dat,table(age_stratum,batch,HTG_group))),"batch_age_htg_counts.csv")
+markers <- c("IL-8","Ferritin","Platelets","hsCRP","PCT")
+coverage <- bind_rows(lapply(c("all","ge65","lt65"),function(g){
+ z <- if(g=="all") dat else dat[dat$age_stratum==g,]
+ data.frame(cohort=g,measure=c("RNA_D1","TG",markers,"Propofol"),
+ n=c(nrow(z),sum(is.finite(z$Triglycerides)),sapply(z[markers],function(v)sum(is.finite(v))),sum(is.finite(z$Propofol))))
+}))
+save_csv(coverage,"sample_intersections.csv")
+audit <- data.frame(item=c("Historical reported older DEGs","Saved gene-level older DEGs","Stale DEG_summary.csv older DEGs",
+ "Historical reported younger DEGs","Archived rerun younger DEGs","Old age model within-stratum Age",
+ "TG source units","Clinical assay timestamps/units/limits","Propofol meaning",
+ "Nature figure skill"),value=c("357 FDR; 187 FC>1.5; 138 up; 49 down",
+ sprintf("%d FDR; %d FC>1.5; %d up; %d down",sum(legacy_gene$padj<.05,na.rm=TRUE),sum(legacy_gene$padj<.05 & abs(legacy_gene$log2FoldChange)>log2(1.5),na.rm=TRUE),sum(legacy_gene$padj<.05 & legacy_gene$log2FoldChange>log2(1.5),na.rm=TRUE),sum(legacy_gene$padj<.05 & legacy_gene$log2FoldChange< -log2(1.5),na.rm=TRUE)),
+ paste(legacy_deg$DEG_FDR_0.05[legacy_deg$Cohort=="MASS_batches_1_2" & legacy_deg$Age_group==">=65"],collapse=""),
+ "0 FDR","0 FDR","Absent from original run_stratified_deseq covariates",
+ "HTG threshold 1.7 in source script; mmol/L not verified in clinical source",
+ "Not encoded in joined patient-level CSV; D1 alignment is by patient and RNA timepoint only",
+ "Metabolomics-derived relative propofol beta-D-glucuronide feature, not dose or plasma concentration",
+ "Not found in project or installed skill catalog"))
+save_csv(audit,"provenance_audit.csv")
+```
+
+## Expression preprocessing and locked pathway coverage
+
+TMM-normalized logCPM from all 390 samples is used for scoring. `filterByExpr` uses a design containing age stratum, TG group and batch. No outcome-dependent feature selection or batch subtraction is applied before GSVA; batch is handled in association models.
+
+```{r scoring}
+design_filter <- model.matrix(~ age_stratum + HTG_group + batch,dat)
+dge <- DGEList(raw_counts[,dat$SampleID,drop=FALSE])
+keep <- filterByExpr(dge,design=design_filter)
+dge <- calcNormFactors(dge[keep,,keep.lib.sizes=FALSE],method="TMM")
+expr <- cpm(dge,log=TRUE,prior.count=2)
+gene_map <- data.frame(gene_id=rownames(expr),gene_id_clean=sub("\\..*$","",rownames(expr))) %>%
+ left_join(as.data.frame(gene_attr) %>% transmute(gene_id_clean=sub("\\..*$","",gene_id),SYMBOL) %>%
+ distinct(gene_id_clean,.keep_all=TRUE),by="gene_id_clean")
+ok <- !is.na(gene_map$SYMBOL) & gene_map$SYMBOL!="" & !grepl("^ENSG",gene_map$SYMBOL)
+expr_symbol <- avereps(expr[ok,,drop=FALSE],ID=gene_map$SYMBOL[ok])
+gmt_lines <- readLines(file.path(source_path,"Utility/c5.go.bp.v2025.1.Hs.symbols.gmt"))
+gmt_names <- sub("\t.*$","",gmt_lines)
+sets <- lapply(spec$term,function(t) unique(strsplit(gmt_lines[match(t,gmt_names)],"\t",fixed=TRUE)[[1]][-(1:2)]))
+names(sets) <- spec$term
+stopifnot(all(spec$term %in% gmt_names))
+sets <- lapply(sets,function(x) x[!is.na(x) & nzchar(x)])
+gene_members <- bind_rows(lapply(names(sets),function(t) data.frame(term=t,gene=sets[[t]],detected=sets[[t]] %in% rownames(expr_symbol))))
+save_csv(gene_members,"gene_set_membership.csv")
+set_coverage <- gene_members %>% group_by(term) %>% summarise(source_size=n(),detected_size=sum(detected),coverage=mean(detected),.groups="drop") %>%
+ left_join(spec,by="term") %>% mutate(eligible=detected_size>=10 & detected_size<=500)
+save_csv(set_coverage,"gene_set_coverage.csv")
+eligible <- set_coverage$term[set_coverage$eligible]
+stopifnot(length(eligible)>0)
+param <- GSVA::gsvaParam(as.matrix(expr_symbol),sets[eligible],kcdf="Gaussian",minSize=10,maxSize=500)
+score <- GSVA::gsva(param,verbose=FALSE)
+saveRDS(score,file.path(out,"gsva_scores.rds"))
+fwrite(data.frame(SampleID=colnames(score),t(score),check.names=FALSE),file.path(out,"gsva_scores.csv"))
+for(t in rownames(score)) dat[[t]] <- as.numeric(scale(score[t,match(dat$SampleID,colnames(score))]))
+```
+
+## Regression functions and diagnostic records
+
+Primary models use complete cases per comparison. Immune outcomes are standardized after `log1p` for nonnegative IL-8, ferritin, hsCRP and PCT; platelets are standardized untransformed. Negative assay values are treated as missing. No undocumented detection-limit substitution is applied. Expanded models use observed propofol feature values without imputation. HC3 standard errors and model-based 95% intervals are reported.
+
+```{r models}
+fit_one <- function(z,y,x,adj,cohort,model,term,marker=NA_character_){
+ vars <- unique(c(y,x,adj)); q <- z[,vars,drop=FALSE]
+ q <- q[complete.cases(q),,drop=FALSE]
+ if(nrow(q)<25 || length(unique(q[[x]]))<5) return(data.frame(cohort,model,term,marker,n=nrow(q),beta=NA_real_,lo=NA_real_,hi=NA_real_,p=NA_real_,r2=NA_real_,max_cook=NA_real_,rank_ok=FALSE))
+ for(v in adj) if(is.character(q[[v]]) || is.factor(q[[v]])) q[[v]] <- droplevels(factor(q[[v]]))
+ f <- reformulate(c(x,adj),response=y)
+ mm <- model.matrix(f,q); rank_ok <- qr(mm)$rank==ncol(mm)
+ if(!rank_ok) return(data.frame(cohort,model,term,marker,n=nrow(q),beta=NA_real_,lo=NA_real_,hi=NA_real_,p=NA_real_,r2=NA_real_,max_cook=NA_real_,rank_ok=FALSE))
+ fit <- lm(f,q)
+ V <- sandwich::vcovHC(fit,type="HC3")
+ b <- coef(fit)[x]; se <- sqrt(V[x,x]); p <- 2*pt(abs(b/se),df.residual(fit),lower.tail=FALSE)
+ data.frame(cohort,model,term,marker,n=nrow(q),beta=unname(b),lo=unname(b-qt(.975,df.residual(fit))*se),
+ hi=unname(b+qt(.975,df.residual(fit))*se),p=unname(p),r2=summary(fit)$r.squared,
+ max_cook=max(cooks.distance(fit)),rank_ok=rank_ok)
+}
+stopifnot(requireNamespace("sandwich",quietly=TRUE))
+primary <- dat %>% filter(age_stratum=="ge65")
+minimal <- c("Age","Gender","batch")
+extended <- c(minimal,"SOFA_24h","MV","Tumor","TransplantHistory","Immunosuppression","Propofol")
+tg_results <- bind_rows(lapply(c("ge65","lt65","all"),function(g){
+ z <- if(g=="all") dat else dat[dat$age_stratum==g,]
+ bind_rows(lapply(eligible,function(t)bind_rows(
+ fit_one(z,t,"log2TG",minimal,g,"minimal",t),
+ fit_one(z,t,"log2TG",extended,g,"extended_observed_propofol",t),
+ fit_one(z[z$batch=="batch1",],t,"log2TG",setdiff(minimal,"batch"),g,"batch1",t),
+ fit_one(z[z$batch=="batch2",],t,"log2TG",setdiff(minimal,"batch"),g,"batch2",t))))
+}))
+tg_results$fdr <- NA_real_
+idx <- tg_results$cohort=="ge65" & tg_results$model=="minimal" & is.finite(tg_results$p)
+tg_results$fdr[idx] <- p.adjust(tg_results$p[idx],method="BH",n=length(eligible))
+save_csv(tg_results,"tg_pathway_models.csv")
+```
+
+## Same-patient immune phenotypes
+
+The primary immune model uses pathway score as predictor and transformed standardized assay value as outcome, with age, sex and batch adjustment. The conditional model adds log2(TG); it is not a mediation analysis.
+
+```{r immune}
+for(m in markers){
+ v <- as.numeric(dat[[m]]); v[!is.finite(v) | v<0] <- NA_real_
+ if(m!="Platelets") v <- log1p(v)
+ dat[[paste0("immune_",match(m,markers))]] <- as.numeric(scale(v))
+}
+immune_results <- bind_rows(lapply(eligible,function(t) bind_rows(lapply(seq_along(markers),function(i){
+ m <- markers[i]; y <- paste0("immune_",i)
+ bind_rows(fit_one(dat[dat$age_stratum=="ge65",],y,t,minimal,"ge65","minimal",t,m),
+ fit_one(dat[dat$age_stratum=="ge65",],y,t,c(minimal,"log2TG"),"ge65","conditional_TG",t,m))
+}))))
+immune_results$fdr <- NA_real_
+idx <- immune_results$model=="minimal" & is.finite(immune_results$p)
+immune_results$fdr[idx] <- p.adjust(immune_results$p[idx],method="BH",n=length(eligible)*length(markers))
+save_csv(immune_results,"immune_pathway_models.csv")
+save_csv(immune_results %>% select(term,marker,model,n,rank_ok),"effective_n_by_comparison.csv")
+```
+
+## Sensitivity, provenance and limitations
+
+```{r sensitivity}
+q99 <- quantile(primary$Triglycerides,.99,na.rm=TRUE)
+trimmed <- primary[primary$Triglycerides<=q99,]
+sens <- bind_rows(lapply(eligible,function(t)fit_one(trimmed,t,"log2TG",minimal,"ge65","TG_le99pct",t)))
+save_csv(sens,"tg_extreme_value_sensitivity.csv")
+## Within-batch detectability is measured on raw counts, never inferred from the batch label.
+batch_detect <- lapply(levels(dat$batch),function(b){
+ ids <- dat$SampleID[dat$batch==b]
+ rowMeans(raw_counts[,ids,drop=FALSE]>=5)>=.2
+})
+names(batch_detect) <- levels(dat$batch)
+save_csv(data.frame(gene_id=rownames(raw_counts),batch1=batch_detect[[1]],batch2=batch_detect[[2]],
+ common=batch_detect[[1]] & batch_detect[[2]]),"batch_gene_detectability.csv")
+save_csv(data.frame(batch1_detected=sum(batch_detect[[1]]),batch2_detected=sum(batch_detect[[2]]),
+ common_detected=sum(batch_detect[[1]] & batch_detect[[2]])),"batch_common_gene_summary.csv")
+common_id <- rownames(raw_counts)[batch_detect[[1]] & batch_detect[[2]]]
+common_symbol <- unique(gene_map$SYMBOL[ok & gene_map$gene_id %in% common_id])
+common_symbol <- intersect(common_symbol,rownames(expr_symbol))
+common_sets <- lapply(sets[eligible],function(x)intersect(x,common_symbol))
+common_sets <- common_sets[vapply(common_sets,length,integer(1))>=10]
+common_param <- GSVA::gsvaParam(as.matrix(expr_symbol[common_symbol,,drop=FALSE]),common_sets,
+ kcdf="Gaussian",minSize=10,maxSize=500)
+common_scores <- GSVA::gsva(common_param,verbose=FALSE)
+common_dat <- dat
+for(t in rownames(common_scores)) common_dat[[t]] <- as.numeric(scale(common_scores[t,match(dat$SampleID,colnames(common_scores))]))
+common_effects <- bind_rows(lapply(rownames(common_scores),function(t)
+ fit_one(common_dat[common_dat$age_stratum=="ge65",],t,"log2TG",minimal,"ge65","common_detectable_genes",t)))
+save_csv(common_effects,"common_detectable_gene_sensitivity.csv")
+save_csv(data.frame(term=names(common_sets),common_detected_size=vapply(common_sets,length,integer(1))),
+ "common_detectable_gene_set_sizes.csv")
+## Formal age-stratum interaction; a contrast of two within-stratum P values is not this test.
+interaction_results <- bind_rows(lapply(eligible,function(t){
+ q <- dat[,c(t,"log2TG","age_stratum","Age","Gender","batch")]
+ q <- q[complete.cases(q),]
+ q$age_stratum <- factor(q$age_stratum,levels=c("lt65","ge65"))
+ fit <- lm(reformulate(c("log2TG*age_stratum","Age","Gender","batch"),response=t),q)
+ nm <- "log2TG:age_stratumge65"; V <- sandwich::vcovHC(fit,type="HC3")
+ b <- coef(fit)[nm]; se <- sqrt(V[nm,nm]); df <- df.residual(fit)
+ data.frame(term=t,n=nrow(q),beta=unname(b),lo=unname(b-qt(.975,df)*se),hi=unname(b+qt(.975,df)*se),
+ p=unname(2*pt(abs(b/se),df,lower.tail=FALSE)))
+}))
+interaction_results$fdr <- p.adjust(interaction_results$p,"BH")
+save_csv(interaction_results,"formal_age_interaction.csv")
+old_deg <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/MASS_batches_1_2_age_ge65_HTG_vs_nonHTG_all_genes.csv"))
+young_deg <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/MASS_batches_1_2_age_lt65_HTG_vs_nonHTG_all_genes.csv"))
+historical_check <- data.frame(source=c("User-reported published result","Archived 2026-08-03 script and saved table"),
+ older_fdr=c(357,sum(old_deg$padj<.05,na.rm=TRUE)),older_fdr_fc15=c(187,sum(old_deg$padj<.05 & abs(old_deg$log2FoldChange)>log2(1.5),na.rm=TRUE)),
+ younger_fdr=c(0,sum(young_deg$padj<.05,na.rm=TRUE)))
+save_csv(historical_check,"historical_deg_reconciliation.csv")
+writeLines(capture.output(sessionInfo()),file.path(out,"sessionInfo.txt"))
+```
+
+## Figure 4 and source data
+
+The editable volcanoes are redrawn from archived gene-level differential expression tables. The older table reproduces the reported 357/187/138/49 counts; the saved summary CSV contains a stale 305 count. The original designed panel still needs its editable source for exact visual replacement.
+
+```{r figure, fig.width=12, fig.height=9}
+theme_pub <- theme_classic(base_size=9)+theme(plot.title=element_text(size=10,face="bold"),axis.text=element_text(size=8),legend.text=element_text(size=8))
+volcano <- function(d,title){
+ d <- as.data.frame(d); d <- d[is.finite(d$log2FoldChange) & is.finite(d$padj) & d$padj>0,]
+ d$class <- ifelse(d$padj<.05 & d$log2FoldChange>log2(1.5),"Up",ifelse(d$padj<.05 & d$log2FoldChange< -log2(1.5),"Down","Other"))
+ ggplot(d,aes(log2FoldChange,-log10(padj),color=class))+geom_point(size=.38,alpha=.7)+
+ scale_color_manual(values=c(Down="#3B75AF",Other="#B7BDC4",Up="#D99038"))+
+ labs(title=title,x="log2 fold change",y="-log10 FDR",color=NULL)+theme_pub+
+ theme(legend.position="bottom")
+}
+p_a <- volcano(young_deg,"a  <65 years") | volcano(old_deg,"a  >=65 years")
+gsea <- fread(file.path(project,"code/Outputs/260803_DEGstratifiedbyAge/MASS_batches_1_2/MASS_batches_1_2_age_ge65_HTG_vs_nonHTG_GSEA_GOBP.csv"))
+save_csv(gsea,"existing_full_older_gsea.csv")
+save_csv(old_deg,"existing_full_older_deg.csv")
+save_csv(young_deg,"existing_full_younger_deg.csv")
+chosen <- c("GOBP_CELL_CYCLE_G1_S_PHASE_TRANSITION","GOBP_DNA_TEMPLATED_DNA_REPLICATION","GOBP_OXIDATIVE_PHOSPHORYLATION","GOBP_MACROAUTOPHAGY","GOBP_ENDOSOME_TO_LYSOSOME_TRANSPORT","GOBP_POST_GOLGI_VESICLE_MEDIATED_TRANSPORT")
+gsea_show <- as.data.frame(gsea[gsea$pathway %in% chosen,c("pathway","NES","padj"),with=FALSE])
+gsea_show$label <- gsub("_"," ",sub("^GOBP_","",gsea_show$pathway))
+p_b <- ggplot(gsea_show,aes(NES,reorder(label,NES),fill=NES>0))+geom_col(width=.7)+
+ scale_fill_manual(values=c("#3B75AF","#D99038"),guide="none")+
+ labs(title="b  Core transcriptional programs",x="GSEA normalized enrichment score",y=NULL)+theme_pub
+tg_show <- tg_results %>% filter(cohort=="ge65",model=="minimal",term %in% chosen)
+tg_show$label <- gsub("_"," ",sub("^GOBP_","",tg_show$term))
+p_c <- ggplot(tg_show,aes(beta,reorder(label,beta)))+geom_vline(xintercept=0,color="grey70")+
+ geom_errorbarh(aes(xmin=lo,xmax=hi),height=.15,color="#3B75AF")+geom_point(color="#174E7A",size=1.7)+
+ geom_text(aes(x=.46,label=paste0("FDR ",sprintf("%.3f",fdr),"; n=",n)),hjust=0,size=2.4)+
+ scale_x_continuous(limits=c(-.25,.8))+labs(title="c  Continuous TG and pathway score",x="SD score change per TG doubling (95% CI)",y=NULL)+theme_pub
+immune_show <- immune_results %>% filter(model=="minimal",term %in% chosen)
+immune_show$label <- gsub("_"," ",sub("^GOBP_","",immune_show$term))
+# 显著性读取全部70项比较已计算的BH-FDR，不按主图子集重新校正。
+immune_show$significance <- ifelse(is.na(immune_show$fdr), "", ifelse(immune_show$fdr < .001, "***", ifelse(immune_show$fdr < .01, "**", ifelse(immune_show$fdr < .05, "*", ""))))
+immune_show$tile_label <- ifelse(is.na(immune_show$beta), "NA", paste0(sprintf("%.2f", immune_show$beta), immune_show$significance))
+p_d <- ggplot(immune_show,aes(marker,label,fill=beta))+geom_tile(color="white")+
+ geom_text(aes(label=tile_label),size=2.4)+
+ scale_fill_gradient2(low="#3B75AF",mid="white",high="#D99038",midpoint=0,na.value="grey85")+
+ labs(title="d  Pathways and circulating phenotypes",caption="BH-FDR across all 70 tests: * <0.05; ** <0.01; *** <0.001. Unmarked: FDR >=0.05.",x=NULL,y=NULL,fill="Adjusted beta")+theme_pub+
+ theme(axis.text.x=element_text(angle=35,hjust=1))
+figure4 <- p_a / p_b / p_c / p_d + plot_layout(heights=c(1.5,1,1,1.25))
+ggsave(file.path(fig,"Figure4.pdf"),figure4,width=10.8,height=12,device=cairo_pdf)
+ggsave(file.path(fig,"Figure4.svg"),figure4,width=10.8,height=12,device=svglite::svglite)
+ggsave(file.path(fig,"Figure4.tiff"),figure4,width=10.8,height=12,dpi=600,compression="lzw",device=ragg::agg_tiff)
+save_csv(gsea_show,"Figure4b_source_data.csv")
+save_csv(tg_show,"Figure4c_source_data.csv")
+save_csv(immune_show,"Figure4d_source_data.csv")
+save_csv(old_deg[,c("gene_id","SYMBOL","log2FoldChange","padj"),with=FALSE],"Figure4a_older_source_data.csv")
+save_csv(young_deg[,c("gene_id","SYMBOL","log2FoldChange","padj"),with=FALSE],"Figure4a_younger_source_data.csv")
+figure4
+```
+
+## Reproduction
+
+Run from this directory with `Rscript -e 'rmarkdown::render("Figure4_analysis.Rmd", output_file="analysis_notebook.html")'`, then `Rscript reports/build_report.R`. Existing project results are read-only; the new directory contains all new exports. The analysis uses complete cases and does not infer assay timestamps or detection limits from figures.
